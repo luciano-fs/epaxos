@@ -31,10 +31,9 @@ type Replica struct {
 	counter               int
 	flush                 bool
 	executedUpTo          int32
-	batchWait             int
 }
 
-func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, batchWait int, f int) *Replica {
+func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, f int) *Replica {
 	r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply, f),
 		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
 		make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
@@ -57,18 +56,6 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
 	return r
 }
 
-//append a log entry to stable storage
-func (r *Replica) recordInstanceMetadata(inst *Instance) {
-	if !r.Durable {
-		return
-	}
-
-	var b [5]byte
-	binary.LittleEndian.PutUint32(b[0:4], uint32(inst.bal))
-	b[4] = byte(inst.status)
-	r.StableStore.Write(b[:])
-}
-
 //write a sequence of commands to stable storage
 func (r *Replica) recordCommands(cmds []state.Command) {
 	if !r.Durable {
@@ -78,6 +65,7 @@ func (r *Replica) recordCommands(cmds []state.Command) {
 	if cmds == nil {
 		return
 	}
+
 	for i := 0; i < len(cmds); i++ {
 		cmds[i].Marshal(io.Writer(r.StableStore))
 	}
@@ -94,18 +82,8 @@ func (r *Replica) sync() {
 
 /* RPC to be called by master */
 
-func (r *Replica) BeTheLeader(args *genericsmrproto.BeTheLeaderArgs, reply *genericsmrproto.BeTheLeaderReply) error {
-	r.IsLeader = true
-	log.Println("I am the leader")
-	return nil
-}
-
-func (r *Replica) replyPrepare(replicaId int32, reply *paxosproto.PrepareReply) {
-	r.SendMsg(replicaId, r.prepareReplyRPC, reply)
-}
-
-func (r *Replica) replyAccept(replicaId int32, reply *paxosproto.AcceptReply) {
-	r.SendMsg(replicaId, r.acceptReplyRPC, reply)
+func (r *Replica) replyPropose(replicaId int32, reply *paxosproto.ProposeReply) {
+	r.SendMsg(replicaId, r.proposeReplyRPC, reply)
 }
 
 /* Clock goroutine */
@@ -215,18 +193,6 @@ func (r *Replica) run() {
 		}
 
 	}
-}
-
-func (r *Replica) makeBallot(instance int32) {
-	lb := r.instanceSpace[instance].lb
-	n := int32(r.Id)
-	if r.IsLeader {
-		for n < r.defaultBallot[r.Id] || n < r.maxRecvBallot {
-			n += int32(r.N)
-		}
-	}
-	lb.lastTriedBallot = n
-	dlog.Printf("Last tried ballot is %d in %d\n", lb.lastTriedBallot, instance)
 }
 
 func (r *Replica) bcastPrepare(instance int32) {
