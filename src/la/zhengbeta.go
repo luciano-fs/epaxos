@@ -21,16 +21,18 @@ const FALSE = uint8(0)
 
 type Replica struct {
     *genericsmr.Replica   // extends a generic Paxos replica
+    viewChan              chan fastrpc.Serializable
     writeChan             chan fastrpc.Serializable
     writeAckChan          chan fastrpc.Serializable
     readChan              chan fastrpc.Serializable
     readAckChan           chan fastrpc.Serializable
-    proposeRPC            uint8
-    replyRPC	      uint8
+    writeRPC              uint8
+    writeAckRPC           uint8
+    readRPC	          uint8
+    readAckRPC	          uint8
+    viewRPC	          uint8
     active                bool
     activeProposalNb      uint8
-    ackCount              uint8
-    nackCount             uint8
     proposedValue         L
     acceptedValue         L
     outputValue           L
@@ -54,6 +56,7 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
     r.Durable = durable
 
     r.proposeRPC = r.RegisterRPC(new(laproto.Propose), r.proposeChan)
+    r.replyRPC = r.RegisterRPC(new(laproto.Reply), r.replyChan)
     r.replyRPC = r.RegisterRPC(new(laproto.Reply), r.replyChan)
 
     go r.run()
@@ -105,10 +108,35 @@ func (r *Replica) run() {
     }
 }
 
-func (r *Replica) bcastPropose() {
+func (r *Replica) bcastWrite() {
     defer func() {
         if err := recover(); err != nil {
-                log.Println("Propose bcast failed:", err)
+                log.Println("Write bcast failed:", err)
+        }
+    }()
+
+    args := &laproto.Write{r.Id, r.activeProposalNb, r.proposedValue}
+
+    n := r.N - 1
+
+    sent := 0
+    for q := 0; q < r.N-1; q++ {
+        if !r.Alive[r.PreferredPeerOrder[q]] {
+            continue
+        }
+        r.SendMsg(r.PreferredPeerOrder[q], r.proposeRPC, args)
+        sent++
+        if sent >= n {
+            break
+        }
+    }
+
+}
+
+func (r *Replica) bcastRead() {
+    defer func() {
+        if err := recover(); err != nil {
+                log.Println("Read bcast failed:", err)
         }
     }()
 
