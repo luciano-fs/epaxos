@@ -22,14 +22,13 @@ const FALSE = uint8(0)
 type Replica struct {
     *genericsmr.Replica   // extends a generic Paxos replica
     proposeChan           chan fastrpc.Serializable
-    replyChan	      chan fastrpc.Serializable
+    replyChan	          chan fastrpc.Serializable
     proposeRPC            uint8
-    replyRPC	      uint8
+    replyRPC	          uint8
     active                bool
     activeProposalNb      uint8
     ackCount              uint8
     nackCount             uint8
-    proposedValue         L
     acceptedValue         L
     outputValue           L
     Shutdown              bool
@@ -110,7 +109,7 @@ func (r *Replica) bcastPropose() {
         }
     }()
 
-    args := &laproto.Propose{r.Id, r.activeProposalNb, r.proposedValue}
+    args := &laproto.Propose{r.Id, r.activeProposalNb, r.acceptedValue}
 
     n := r.N - 1
 
@@ -129,8 +128,10 @@ func (r *Replica) bcastPropose() {
 }
 
 func (r *Replica) handlePropose(propose *laproto.Propose) {
-    r.acceptedValue = join(r.acceptedValue, propose.Value)
-    preply := &laproto.ProposeReply{propose.number, diff(r.acceptedValue, propose.Value}
+    if leq(r.acceptedValue, propose.Value) {
+        r.acceptedValue = propose.Value
+    }
+    preply := &laproto.ProposeReply{propose.number, diff(r.acceptedValue, propose.Value)}
     r.replyPropose(r.Id, preply)
 }
 
@@ -146,21 +147,21 @@ func (r *Replica) handleProposeReply(preply *laproto.ProposeReply) {
     }
 
     if ProposeReply.Delta == lattice.Bot { //ACK
-        r.accCount++
+        r.ackCount++
     } else { //NACK
         r.nackCount++
-        r.proposedValue = join(r.proposedValue, preply.Delta)
+        r.acceptValue = join(r.acceptValue, preply.Delta)
     }
 
     if r.ackCount + r.nackCount > (r.N + 1)/2 {
-        if r.nackCount > 0 { //Decide
-            r.active = false
-            r.outputValue = r.proposedValue
-        } else { //Refine
+        if r.activeProposalNb > r.F || r.nackCount == 0 { //Decide
             r.activeProposalNb ++
             r.ackCount = 0
             r.nackCount = 0
             r.bcastPropose()
+        } else {
+            r.active = false
+            r.outputValue = r.acceptValue
         }
     }
 }
