@@ -21,8 +21,10 @@ const FALSE = uint8(0)
 
 type Replica struct {
     *genericsmr.Replica   // extends a generic Paxos replica
-    proposeChan           chan fastrpc.Serializable
-    replyChan	      chan fastrpc.Serializable
+    writeChan             chan fastrpc.Serializable
+    writeAckChan          chan fastrpc.Serializable
+    readChan              chan fastrpc.Serializable
+    readAckChan           chan fastrpc.Serializable
     proposeRPC            uint8
     replyRPC	      uint8
     active                bool
