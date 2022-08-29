@@ -32,9 +32,12 @@ type Replica struct {
     readRPC	          uint8
     readAckRPC	          uint8
     viewRPC	          uint8
-    activeProposalNb      uint8
+    round                 uint8
     view                  IntSet
     label                 float32
+    waitWrite             bool
+    waitRead              bool
+    waitView              bool
     outputValue           L
     Shutdown              bool
 }
@@ -55,9 +58,11 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
 
     r.Durable = durable
 
-    r.proposeRPC = r.RegisterRPC(new(laproto.Propose), r.proposeChan)
-    r.replyRPC = r.RegisterRPC(new(laproto.Reply), r.replyChan)
-    r.replyRPC = r.RegisterRPC(new(laproto.Reply), r.replyChan)
+    r.viewRPC       = r.RegisterRPC(new(laproto.View), r.viewChan)
+    r.writeRPC      = r.RegisterRPC(new(laproto.Write), r.writeChan)
+    r.writeReplyRPC = r.RegisterRPC(new(laproto.WriteReply), r.writeReplyChan)
+    r.readRPC       = r.RegisterRPC(new(laproto.Read), r.readChan)
+    r.readReplyRPC  = r.RegisterRPC(new(laproto.ReadReply), r.readReplyChan)
 
     go r.run()
 
@@ -83,7 +88,6 @@ func (r *Replica) replyPropose(replicaId int32, reply *paxosproto.ProposeReply) 
 /* Main event processing loop */
 
 func (r *Replica) run() {
-
     r.ConnectToPeers()
     r.ComputeClosestPeers()
     go r.WaitForClientConnections()
@@ -140,7 +144,7 @@ func (r *Replica) bcastView() {
         if !r.Alive[r.PreferredPeerOrder[q]] {
             continue
         }
-        r.SendMsg(r.PreferredPeerOrder[q], r.proposeRPC, args)
+        r.SendMsg(r.PreferredPeerOrder[q], r.viewRPC, args)
         sent++
         if sent >= n {
             break
@@ -149,14 +153,14 @@ func (r *Replica) bcastView() {
 
 }
 
-func (r *Replica) bcastRead() {
+func (r *Replica) bcastRead(k float32, round int) {
     defer func() {
         if err := recover(); err != nil {
                 log.Println("Read bcast failed:", err)
         }
     }()
 
-    args := &laproto.Propose{r.Id, r.activeProposalNb, r.proposedValue}
+    args := &laproto.Read{r.Id, k, round}
 
     n := r.N - 1
 
@@ -165,7 +169,7 @@ func (r *Replica) bcastRead() {
         if !r.Alive[r.PreferredPeerOrder[q]] {
             continue
         }
-        r.SendMsg(r.PreferredPeerOrder[q], r.proposeRPC, args)
+        r.SendMsg(r.PreferredPeerOrder[q], r.readRPC, args)
         sent++
         if sent >= n {
             break
@@ -174,7 +178,31 @@ func (r *Replica) bcastRead() {
 
 }
 
-func (r *Replica) handlePropose(propose *laproto.Propose) {
+func (r *Replica) bcastWrite(v IntSet, k float32, round int) {
+    defer func() {
+        if err := recover(); err != nil {
+                log.Println("Read bcast failed:", err)
+        }
+    }()
+
+    args := &laproto.write{r.Id, v, k, round}
+
+    n := r.N - 1
+
+    sent := 0
+    for q := 0; q < r.N-1; q++ {
+        if !r.Alive[r.PreferredPeerOrder[q]] {
+            continue
+        }
+        r.SendMsg(r.PreferredPeerOrder[q], r.writeRPC, args)
+        sent++
+        if sent >= n {
+            break
+        }
+    }
+}
+
+func (r *Replica) handleView(view *laproto.View) {
     r.acceptedValue = join(r.acceptedValue, propose.Value)
     preply := &laproto.ProposeReply{propose.number, diff(r.acceptedValue, propose.Value}
     r.replyPropose(r.Id, preply)
