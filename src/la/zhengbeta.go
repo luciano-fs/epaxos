@@ -1,4 +1,4 @@
-package paxos
+package la
 
 import (
     "dlog"
@@ -13,6 +13,7 @@ import (
     "state"
     "time"
     "lattice"
+    "set"
 )
 
 const CHAN_BUFFER_SIZE = 200000
@@ -31,10 +32,9 @@ type Replica struct {
     readRPC	          uint8
     readAckRPC	          uint8
     viewRPC	          uint8
-    active                bool
     activeProposalNb      uint8
-    proposedValue         L
-    acceptedValue         L
+    view                  IntSet
+    label                 float32
     outputValue           L
     Shutdown              bool
 }
@@ -92,30 +92,46 @@ func (r *Replica) run() {
 
         select {
 
-        case propose := <-proposeChan:
-            dlog.Printf("Received a Propose from replica ...\n") //TODO: extract which replica sent the proposal and show it here
-            r.handlePropose(propose)
+        case view := <-viewChan:
+            dlog.Printf("Received a view from replica ...\n") //TODO: extract which replica sent the view and show it here
+            r.handleView(view)
             break
 
-        case proposeReply := <-r.proposeReplyChan:
-            //TODO: check if there needs to be a cast here
+        case write := <-writeChan:
+            dlog.Printf("Received a write from replica ...\n") //TODO: extract which replica sent the write and show it here
+            r.handleWrite(write)
+            break
+
+        case writeReply := <-r.writeReplyChan:
             //TODO: extract to which seq the reply was issued and show it here
-            dlog.Printf("Received reply for j-th proposal\n")
-            r.handleProposeReply(prepareReply)
+            dlog.Printf("Received reply for j-th write\n")
+            r.handleWrtieReply(writeReply)
+            break
+        }
+
+        case read := <-readChan:
+            dlog.Printf("Received a read from replica ...\n") //TODO: extract which replica sent the write and show it here
+            r.handleRead(read)
+            break
+
+        case readReply := <-r.readReplyChan:
+            //TODO: extract to which seq the reply was issued and show it here
+            dlog.Printf("Received reply for j-th read\n")
+            r.handleReadReply(readReply)
             break
         }
 
     }
 }
 
-func (r *Replica) bcastWrite() {
+func (r *Replica) bcastView() {
     defer func() {
         if err := recover(); err != nil {
-                log.Println("Write bcast failed:", err)
+                log.Println("View bcast failed:", err)
         }
     }()
 
-    args := &laproto.Write{r.Id, r.activeProposalNb, r.proposedValue}
+    args := &laproto.View{r.Id, r.view}
 
     n := r.N - 1
 
