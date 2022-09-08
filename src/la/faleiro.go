@@ -59,6 +59,7 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
     return r
 }
 
+// DELETE
 //sync with the stable store
 func (r *Replica) sync() {
     if !r.Durable {
@@ -68,7 +69,6 @@ func (r *Replica) sync() {
     r.StableStore.Sync()
 }
 
-/* RPC to be called by master */
 func (r *Replica) replyPropose(replicaId int32, reply *paxosproto.ProposeReply) {
     r.SendMsg(replicaId, r.proposeReplyRPC, reply)
 }
@@ -81,7 +81,8 @@ func (r *Replica) run() {
 
     r.ConnectToPeers()
     r.ComputeClosestPeers()
-    go r.WaitForClientConnections()
+    //go r.WaitForClientConnections()
+    // TODO: propose here!
 
     for !r.Shutdown {
 

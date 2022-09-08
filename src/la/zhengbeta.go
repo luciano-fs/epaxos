@@ -22,30 +22,40 @@ const FALSE = uint8(0)
 
 type Replica struct {
     *genericsmr.Replica   // extends a generic Paxos replica
-    viewChan              chan fastrpc.Serializable
+    valueChan             chan fastrpc.Serializable
     writeChan             chan fastrpc.Serializable
-    writeAckChan          chan fastrpc.Serializable
+    writeReplyChan          chan fastrpc.Serializable
     readChan              chan fastrpc.Serializable
-    readAckChan           chan fastrpc.Serializable
+    readReplyChan           chan fastrpc.Serializable
     writeRPC              uint8
-    writeAckRPC           uint8
+    writeReplyRPC           uint8
     readRPC	          uint8
-    readAckRPC	          uint8
-    viewRPC	          uint8
+    readReplyRPC	          uint8
+    valueRPC	          uint8
     round                 uint8
     view                  IntSet
     label                 float32
     waitWrite             bool
     waitRead              bool
-    waitView              bool
+    waitValue             bool
+    waitWrite             uint8
+    waitRead              uint8
+    initValue             L
     outputValue           L
     Shutdown              bool
 }
 
-func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec bool, lread bool, dreply bool, durable bool, f int) *Replica {
-    r := &Replica{genericsmr.NewReplica(id, peerAddrList, thrifty, exec, lread, dreply, f),
+func NewReplica(id int, peerAddrList []string, f int) *Replica {
+    r := &Replica{genericsmr.NewReplica(id, peerAddrList, false, false, false, false, f),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
+        0,
+        0,
+        0,
+        0,
         0,
         0,
         false,
@@ -56,9 +66,7 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
         false,
         }
 
-    r.Durable = durable
-
-    r.viewRPC       = r.RegisterRPC(new(laproto.View), r.viewChan)
+    r.valueRPC       = r.RegisterRPC(new(laproto.Value), r.valueChan)
     r.writeRPC      = r.RegisterRPC(new(laproto.Write), r.writeChan)
     r.writeReplyRPC = r.RegisterRPC(new(laproto.WriteReply), r.writeReplyChan)
     r.readRPC       = r.RegisterRPC(new(laproto.Read), r.readChan)
@@ -69,16 +77,6 @@ func NewReplica(id int, peerAddrList []string, Isleader bool, thrifty bool, exec
     return r
 }
 
-//sync with the stable store
-func (r *Replica) sync() {
-    if !r.Durable {
-        return
-    }
-
-    r.StableStore.Sync()
-}
-
-/* RPC to be called by master */
 func (r *Replica) replyPropose(replicaId int32, reply *paxosproto.ProposeReply) {
     r.SendMsg(replicaId, r.proposeReplyRPC, reply)
 }
@@ -92,13 +90,15 @@ func (r *Replica) run() {
     r.ComputeClosestPeers()
     go r.WaitForClientConnections()
 
+    bcastValue()
+
     for !r.Shutdown {
 
         select {
 
-        case view := <-viewChan:
-            dlog.Printf("Received a view from replica ...\n") //TODO: extract which replica sent the view and show it here
-            r.handleView(view)
+        case value := <-valueChan:
+            dlog.Printf("Received a value from replica ...\n") //TODO: extract which replica sent the value and show it here
+            r.handleValue(value)
             break
 
         case write := <-writeChan:
@@ -128,43 +128,24 @@ func (r *Replica) run() {
     }
 }
 
-func (r *Replica) bcastView() {
-    defer func() {
-        if err := recover(); err != nil {
-                log.Println("View bcast failed:", err)
-        }
-    }()
+func (r *Replica) bcastValue() {
+    args := &laproto.Value{r.Id, r.initValue}
 
-    args := &laproto.View{r.Id, r.view}
-
-    n := r.N - 1
-
-    sent := 0
     for q := 0; q < r.N-1; q++ {
         if !r.Alive[r.PreferredPeerOrder[q]] {
             continue
         }
-        r.SendMsg(r.PreferredPeerOrder[q], r.viewRPC, args)
-        sent++
-        if sent >= n {
-            break
-        }
+        r.SendMsg(r.PreferredPeerOrder[q], r.valueRPC, args)
     }
 
+    r.view = r.view.join(inputValue)
+    r.waitValue = true
+    r.valueCount = 1
 }
 
-func (r *Replica) bcastRead(k float32, round int) {
-    defer func() {
-        if err := recover(); err != nil {
-                log.Println("Read bcast failed:", err)
-        }
-    }()
+func (r *Replica) bcastRead(round int) {
+    args := &laproto.Read{r.Id, round}
 
-    args := &laproto.Read{r.Id, k, round}
-
-    n := r.N - 1
-
-    sent := 0
     for q := 0; q < r.N-1; q++ {
         if !r.Alive[r.PreferredPeerOrder[q]] {
             continue
@@ -176,65 +157,74 @@ func (r *Replica) bcastRead(k float32, round int) {
         }
     }
 
+    r.readReplyVal = r.inputVal.Bot()
+    for kj, vj := range r.acceptVal {
+        if kj == r.k {
+            r.readReplyVal = r.readReplyVal.join(vj)
+        }
+    }
+
+    r.readCount = 1
+    r.waitRead = true
 }
 
 func (r *Replica) bcastWrite(v IntSet, k float32, round int) {
-    defer func() {
-        if err := recover(); err != nil {
-                log.Println("Read bcast failed:", err)
-        }
-    }()
-
     args := &laproto.write{r.Id, v, k, round}
 
-    n := r.N - 1
-
-    sent := 0
     for q := 0; q < r.N-1; q++ {
         if !r.Alive[r.PreferredPeerOrder[q]] {
             continue
         }
         r.SendMsg(r.PreferredPeerOrder[q], r.writeRPC, args)
-        sent++
-        if sent >= n {
-            break
+    }
+
+    r.writeReplyVal = r.inputVal.Bot()
+    for kj, vj := range r.acceptVal {
+        if kj == r.k {
+            r.writeReplyVal = r.writeReplyVal.join(vj)
         }
     }
+
+    r.writeCount = 1
+    r.waitWrite = true
 }
 
-func (r *Replica) handleView(view *laproto.View) {
-    r.acceptedValue = join(r.acceptedValue, propose.Value)
-    preply := &laproto.ProposeReply{propose.number, diff(r.acceptedValue, propose.Value}
-    r.replyPropose(r.Id, preply)
-}
-
-func (r *Replica) handleProposeReply(preply *laproto.ProposeReply) {
-    if preply.Number < r.activeProposalNb || r.active == false {
-        dlog.Printf("Message in late \n")
+func (r *Replica) handleValue(value *laproto.Value) {
+    if !waitValue {
         return
     }
 
-    if preply.Number > r.activeProposalNb {
-        dlog.Printf("BUG: This should never happen\n")
+    r.view = r.view.join(value)
+    r.valueCount++
+
+    if r.valueCount == r.N - r.f {
+        bcastWrite()
+    }
+}
+
+func (r *Replica) handleRead(read *laproto.Read) {
+    rreply := &laproto.ReadReply{r.acceptVal,read.Round}
+    r.replyRead(r.Id, rreply)
+}
+
+func (r *Replica) handleWrite(write *laproto.Write) {
+    acceptVal[write.value][write.label] = true
+    wreply := &laproto.WriteReply{r.acceptVal,read.Round}
+    r.replyRead(r.Id, rreply)
+}
+
+func (r *Replica) handleReadReply(rread *laproto.ReadReply) {
+    if !waitRead || rread.Round != r.round {
         return
     }
 
-    if ProposeReply.Delta == lattice.Bot { //ACK
-        r.accCount++
-    } else { //NACK
-        r.nackCount++
-        r.proposedValue = join(r.proposedValue, preply.Delta)
-    }
+    readReplyVal = readReplyVal.join(
+    wreply := &laproto.WriteReply{r.acceptVal,read.Round}
+    r.replyRead(r.Id, rreply)
+}
 
-    if r.ackCount + r.nackCount > (r.N + 1)/2 {
-        if r.nackCount > 0 { //Decide
-            r.active = false
-            r.outputValue = r.proposedValue
-        } else { //Refine
-            r.activeProposalNb ++
-            r.ackCount = 0
-            r.nackCount = 0
-            r.bcastPropose()
-        }
-    }
+func (r *Replica) handleWriteReply(rwrite *laproto.WriteReply) {
+    acceptVal[write.value][write.label] = true
+    wreply := &laproto.WriteReply{r.acceptVal,read.Round}
+    r.replyRead(r.Id, rreply)
 }
