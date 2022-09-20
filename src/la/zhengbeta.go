@@ -17,29 +17,28 @@ import (
 )
 
 const CHAN_BUFFER_SIZE = 200000
-const TRUE = uint8(1)
-const FALSE = uint8(0)
 
 type Replica struct {
     *genericsmr.Replica   // extends a generic Paxos replica
-    valueChan             chan fastrpc.Serializable
+    valueChan              chan fastrpc.Serializable
+    valueAckChan           chan fastrpc.Serializable
     writeChan             chan fastrpc.Serializable
-    writeReplyChan          chan fastrpc.Serializable
+    writeAckChan          chan fastrpc.Serializable
     readChan              chan fastrpc.Serializable
-    readReplyChan           chan fastrpc.Serializable
+    readAckChan           chan fastrpc.Serializable
+    viewRPC               uint8
+    viewAckRPC            uint8
     writeRPC              uint8
-    writeReplyRPC           uint8
-    readRPC	          uint8
-    readReplyRPC	          uint8
-    valueRPC	          uint8
-    round                 uint8
-    view                  IntSet
+    writeAckRPC           uint8
+    readRPC               uint8
+    readAckRPC            uint8
+    round                 uint8 
+    view                  View
     label                 float32
     waitWrite             bool
     waitRead              bool
     waitValue             bool
-    waitWrite             uint8
-    waitRead              uint8
+    acceptVal             map[uint8][map[float32]View]
     initValue             L
     outputValue           L
     Shutdown              bool
@@ -47,9 +46,6 @@ type Replica struct {
 
 func NewReplica(id int, peerAddrList []string, f int) *Replica {
     r := &Replica{genericsmr.NewReplica(id, peerAddrList, false, false, false, false, f),
-        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
-        make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         make(chan fastrpc.Serializable, genericsmr.CHAN_BUFFER_SIZE),
         0,
@@ -66,24 +62,17 @@ func NewReplica(id int, peerAddrList []string, f int) *Replica {
         false,
         }
 
-    r.valueRPC       = r.RegisterRPC(new(laproto.Value), r.valueChan)
-    r.writeRPC      = r.RegisterRPC(new(laproto.Write), r.writeChan)
-    r.writeReplyRPC = r.RegisterRPC(new(laproto.WriteReply), r.writeReplyChan)
-    r.readRPC       = r.RegisterRPC(new(laproto.Read), r.readChan)
-    r.readReplyRPC  = r.RegisterRPC(new(laproto.ReadReply), r.readReplyChan)
+    r.valueRPC     = r.RegisterRPC(new(laproto.Value), r.valueChan)
+    r.valueAckRPC  = r.RegisterRPC(new(laproto.ValueAck), r.valueAckChan)
+    r.readRPC      = r.RegisterRPC(new(laproto.Read), r.readChan)
+    r.readAckRPC   = r.RegisterRPC(new(laproto.ReadAck), r.readAckChan)
+    r.writeRPC     = r.RegisterRPC(new(laproto.Write), r.writeChan)
+    r.writeAckRPC  = r.RegisterRPC(new(laproto.WriteAck), r.writeAckChan)
 
     go r.run()
 
     return r
 }
-
-func (r *Replica) replyPropose(replicaId int32, reply *paxosproto.ProposeReply) {
-    r.SendMsg(replicaId, r.proposeReplyRPC, reply)
-}
-
-/* ============= */
-
-/* Main event processing loop */
 
 func (r *Replica) run() {
     r.ConnectToPeers()
@@ -97,31 +86,29 @@ func (r *Replica) run() {
         select {
 
         case value := <-valueChan:
-            dlog.Printf("Received a value from replica ...\n") //TODO: extract which replica sent the value and show it here
+            dlog.Printf("Received a value from replica ...\n")
             r.handleValue(value)
             break
 
         case write := <-writeChan:
-            dlog.Printf("Received a write from replica ...\n") //TODO: extract which replica sent the write and show it here
+            dlog.Printf("Received a write from replica ...\n")
             r.handleWrite(write)
             break
 
-        case writeReply := <-r.writeReplyChan:
-            //TODO: extract to which seq the reply was issued and show it here
+        case writeAck := <-r.writeAckChan:
             dlog.Printf("Received reply for j-th write\n")
-            r.handleWrtieReply(writeReply)
+            r.handleWrtieAck(writeAck)
             break
         }
 
         case read := <-readChan:
-            dlog.Printf("Received a read from replica ...\n") //TODO: extract which replica sent the write and show it here
+            dlog.Printf("Received a read from replica ...\n")
             r.handleRead(read)
             break
 
-        case readReply := <-r.readReplyChan:
-            //TODO: extract to which seq the reply was issued and show it here
+        case readAck := <-r.readAckChan:
             dlog.Printf("Received reply for j-th read\n")
-            r.handleReadReply(readReply)
+            r.handleReadAck(readAck)
             break
         }
 
@@ -138,12 +125,12 @@ func (r *Replica) bcastValue() {
         r.SendMsg(r.PreferredPeerOrder[q], r.valueRPC, args)
     }
 
-    r.view = r.view.join(inputValue)
+    r.view[r.Id] = r.inputValue
     r.waitValue = true
     r.valueCount = 1
 }
 
-func (r *Replica) bcastRead(round int) {
+func (r *Replica) bcastRead(label float32, round int) {
     args := &laproto.Read{r.Id, round}
 
     for q := 0; q < r.N-1; q++ {
@@ -157,10 +144,10 @@ func (r *Replica) bcastRead(round int) {
         }
     }
 
-    r.readReplyVal = r.inputVal.Bot()
+    r.readAckVal = r.inputVal.Bot()
     for kj, vj := range r.acceptVal {
         if kj == r.k {
-            r.readReplyVal = r.readReplyVal.join(vj)
+            r.readAckVal = r.readAckVal.join(vj)
         }
     }
 
@@ -168,7 +155,7 @@ func (r *Replica) bcastRead(round int) {
     r.waitRead = true
 }
 
-func (r *Replica) bcastWrite(v IntSet, k float32, round int) {
+func (r *Replica) bcastWrite(v Set, k float32, round int) {
     args := &laproto.write{r.Id, v, k, round}
 
     for q := 0; q < r.N-1; q++ {
@@ -178,10 +165,10 @@ func (r *Replica) bcastWrite(v IntSet, k float32, round int) {
         r.SendMsg(r.PreferredPeerOrder[q], r.writeRPC, args)
     }
 
-    r.writeReplyVal = r.inputVal.Bot()
+    r.writeAckVal = r.inputVal.Bot()
     for kj, vj := range r.acceptVal {
         if kj == r.k {
-            r.writeReplyVal = r.writeReplyVal.join(vj)
+            r.writeAckVal = r.writeAckVal.join(vj)
         }
     }
 
@@ -194,7 +181,7 @@ func (r *Replica) handleValue(value *laproto.Value) {
         return
     }
 
-    r.view = r.view.join(value)
+    r.view = r.view.Join(value)
     r.valueCount++
 
     if r.valueCount == r.N - r.f {
@@ -203,28 +190,28 @@ func (r *Replica) handleValue(value *laproto.Value) {
 }
 
 func (r *Replica) handleRead(read *laproto.Read) {
-    rreply := &laproto.ReadReply{r.acceptVal,read.Round}
-    r.replyRead(r.Id, rreply)
+    rreply := &laproto.ReadAck{r.acceptVal,read.Round}
+    r.SendMsg(read.Id, r.readAckRPC, rreply)
 }
 
 func (r *Replica) handleWrite(write *laproto.Write) {
     acceptVal[write.value][write.label] = true
-    wreply := &laproto.WriteReply{r.acceptVal,read.Round}
-    r.replyRead(r.Id, rreply)
+    wreply := &laproto.WriteAck{r.acceptVal,read.Round}
+    r.SendMsg(write.Id, r.writeAckRPC, wreply)
 }
 
-func (r *Replica) handleReadReply(rread *laproto.ReadReply) {
+func (r *Replica) handleReadAck(rread *laproto.ReadAck) {
     if !waitRead || rread.Round != r.round {
         return
     }
 
-    readReplyVal = readReplyVal.join(
-    wreply := &laproto.WriteReply{r.acceptVal,read.Round}
+    readAckVal = readAckVal.Join(rread.Value)
+    wreply := &laproto.WriteAck{r.acceptVal,read.Round}
     r.replyRead(r.Id, rreply)
 }
 
-func (r *Replica) handleWriteReply(rwrite *laproto.WriteReply) {
+func (r *Replica) handleWriteAck(rwrite *laproto.WriteAck) {
     acceptVal[write.value][write.label] = true
-    wreply := &laproto.WriteReply{r.acceptVal,read.Round}
+    wreply := &laproto.WriteAck{r.acceptVal,read.Round}
     r.replyRead(r.Id, rreply)
 }
